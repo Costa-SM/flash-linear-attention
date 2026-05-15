@@ -63,7 +63,7 @@ def causal_conv1d_fwd_kernel(
     else:
         i_n = i_b
         bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
-        p_x = x + i_b * stride_x_n
+        p_x = x + tl.cast(i_b, tl.int64) * stride_x_n
 
     o_d = i_d * BD + tl.arange(0, BD)
     o_w = tl.arange(0, BW) + W - BW
