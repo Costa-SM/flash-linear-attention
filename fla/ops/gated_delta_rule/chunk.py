@@ -10,6 +10,7 @@ import warnings
 import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
+from fla.ops.backends import BackendRegistry
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from fla.ops.common.gate import fused_beta_sigmoid, fused_beta_sigmoid_bwd
@@ -543,6 +544,55 @@ def chunk_gated_delta_rule(
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
+
+    BackendRegistry.ensure_initialized('gated_delta_rule')
+    registry = BackendRegistry._registries.get('gated_delta_rule')
+    if registry is not None:
+        for backend in registry._get_sorted_backends():
+            if not (backend.is_available() and backend.is_enabled()):
+                continue
+            can_use, _ = backend.verify(
+                'chunk_gated_delta_rule',
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+                allow_neg_eigval=allow_neg_eigval,
+                state_v_first=state_v_first,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                cp_context=cp_context,
+                **kwargs,
+            )
+            if not can_use:
+                continue
+            impl = getattr(backend, 'chunk_gated_delta_rule', None)
+            if impl is not None:
+                return impl(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+                    allow_neg_eigval=allow_neg_eigval,
+                    state_v_first=state_v_first,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
+                    cp_context=cp_context,
+                    **kwargs,
+                )
+
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
