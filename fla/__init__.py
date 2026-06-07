@@ -28,56 +28,57 @@ from fla.layers import (
     RWKV6Attention,
     RWKV7Attention,
 )
-from fla.models import (
-    ABCForCausalLM,
-    ABCModel,
-    BitNetForCausalLM,
-    BitNetModel,
-    CombaForCausalLM,
-    CombaModel,
-    DeltaFormerForCausalLM,
-    DeltaFormerModel,
-    DeltaNetForCausalLM,
-    DeltaNetModel,
-    GatedDeltaNetForCausalLM,
-    GatedDeltaNetModel,
-    GatedDeltaProductForCausalLM,
-    GatedDeltaProductModel,
-    GLAForCausalLM,
-    GLAModel,
-    GSAForCausalLM,
-    GSAModel,
-    HGRN2ForCausalLM,
-    HGRN2Model,
-    HGRNForCausalLM,
-    HGRNModel,
-    LightNetForCausalLM,
-    LightNetModel,
-    LinearAttentionForCausalLM,
-    LinearAttentionModel,
-    LogLinearMamba2ForCausalLM,
-    LogLinearMamba2Model,
-    MesaNetForCausalLM,
-    MesaNetModel,
-    MLAForCausalLM,
-    MLAModel,
-    MomForCausalLM,
-    MomModel,
-    NSAForCausalLM,
-    NSAModel,
-    PaTHAttentionForCausalLM,
-    PaTHAttentionModel,
-    RetNetForCausalLM,
-    RetNetModel,
-    RodimusForCausalLM,
-    RodimusModel,
-    RWKV6ForCausalLM,
-    RWKV6Model,
-    RWKV7ForCausalLM,
-    RWKV7Model,
-    TransformerForCausalLM,
-    TransformerModel,
-)
+
+_MODEL_EXPORTS = {
+    "ABCForCausalLM",
+    "ABCModel",
+    "BitNetForCausalLM",
+    "BitNetModel",
+    "CombaForCausalLM",
+    "CombaModel",
+    "DeltaFormerForCausalLM",
+    "DeltaFormerModel",
+    "DeltaNetForCausalLM",
+    "DeltaNetModel",
+    "GatedDeltaNetForCausalLM",
+    "GatedDeltaNetModel",
+    "GatedDeltaProductForCausalLM",
+    "GatedDeltaProductModel",
+    "GLAForCausalLM",
+    "GLAModel",
+    "GSAForCausalLM",
+    "GSAModel",
+    "HGRN2ForCausalLM",
+    "HGRN2Model",
+    "HGRNForCausalLM",
+    "HGRNModel",
+    "LightNetForCausalLM",
+    "LightNetModel",
+    "LinearAttentionForCausalLM",
+    "LinearAttentionModel",
+    "LogLinearMamba2ForCausalLM",
+    "LogLinearMamba2Model",
+    "MesaNetForCausalLM",
+    "MesaNetModel",
+    "MLAForCausalLM",
+    "MLAModel",
+    "MomForCausalLM",
+    "MomModel",
+    "NSAForCausalLM",
+    "NSAModel",
+    "PaTHAttentionForCausalLM",
+    "PaTHAttentionModel",
+    "RetNetForCausalLM",
+    "RetNetModel",
+    "RodimusForCausalLM",
+    "RodimusModel",
+    "RWKV6ForCausalLM",
+    "RWKV6Model",
+    "RWKV7ForCausalLM",
+    "RWKV7Model",
+    "TransformerForCausalLM",
+    "TransformerModel",
+}
 
 __all__ = [
     "ABCAttention",
@@ -157,3 +158,17 @@ __all__ = [
 ]
 
 __version__ = "0.4.2"
+
+
+def __getattr__(name):
+    if name in _MODEL_EXPORTS:
+        from fla import models
+
+        value = getattr(models, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _MODEL_EXPORTS)
