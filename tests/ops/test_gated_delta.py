@@ -458,3 +458,50 @@ def test_chunk_varlen_prefill(
 
     assert_close('o', ref, tri, 0.005)
     assert_close('ht', ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FlashGDN backend requires CUDA')
+@torch.inference_mode()
+def test_chunk_flashgdn_backend_prefill(monkeypatch):
+    pytest.importorskip('tilelang')
+    major, _ = torch.cuda.get_device_capability()
+    if major < 9:
+        pytest.skip(reason='FlashGDN backend targets Hopper/Blackwell GPUs')
+
+    torch.manual_seed(42)
+    B, T, H, K, V = 2, 128, 4, 64, 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(B, T, H, K, dtype=dtype, device=device)
+    k = torch.randn(B, T, H, K, dtype=dtype, device=device)
+    v = torch.randn(B, T, H, V, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    beta = torch.rand(B, T, H, dtype=dtype, device=device).sigmoid()
+    h0 = torch.zeros(B, H, K, V, dtype=torch.float32, device=device)
+
+    monkeypatch.setenv('FLA_FLASH_GDN', '0')
+    ref, ref_ht = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=h0,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    monkeypatch.setenv('FLA_FLASH_GDN', '1')
+    tri, tri_ht = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=h0,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    assert_close('o', ref, tri, 0.005)
+    assert_close('ht', ref_ht, tri_ht, 0.01)
