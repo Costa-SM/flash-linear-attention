@@ -9,7 +9,7 @@ import warnings
 
 import torch
 
-from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
+from fla.modules.l2norm import l2norm_bwd, l2norm_fwd, l2norm_fwd_pair
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from fla.ops.common.gate import fused_beta_sigmoid, fused_beta_sigmoid_bwd
@@ -266,8 +266,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     ):
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
-            q, q_rstd = l2norm_fwd(q)
-            k, k_rstd = l2norm_fwd(k)
+            q, q_rstd, k, k_rstd = l2norm_fwd_pair(q, k)
 
         beta_raw = beta
         if use_beta_sigmoid_in_kernel:
