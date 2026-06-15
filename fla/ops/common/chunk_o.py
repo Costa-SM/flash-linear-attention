@@ -27,10 +27,17 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 @fla_cache_autotune(
     configs=[
         triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 128, 'BV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 64, 'BV': 128}, num_warps=4, num_stages=3),
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 128}, num_warps=4, num_stages=4),
+        triton.Config({'BK': 32, 'BV': 128}, num_warps=2, num_stages=4),
+        triton.Config({'BK': 32, 'BV': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BK': 32, 'BV': 64}, num_warps=2, num_stages=4),
+        triton.Config({'BK': 32, 'BV': 64}, num_warps=2, num_stages=3),
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
+    key=['H', 'HV', 'K', 'V', 'BT', 'USE_G', 'USE_G_GAMMA', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -125,7 +132,7 @@ def chunk_fwd_kernel_o(
     b_v = tl.load(p_v, boundary_check=(0, 1))
     # to fix mma -> mma layout conversion
     # already solved by triton v3.2 or higher
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
+    b_o = (b_o + tl.dot(b_A.to(b_v.dtype), b_v)) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
