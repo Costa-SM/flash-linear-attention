@@ -391,3 +391,107 @@ def chunk_gated_delta_rule_fwd_intra(
         chunk_indices=chunk_indices,
     )
     return w, u, A
+
+
+@triton.heuristics({
+    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
+    'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
+})
+@triton.jit(do_not_specialize=['T'])
+def chunk_gated_delta_rule_fwd_h_o_dense_k64_kernel(
+    q,
+    k,
+    u,
+    w,
+    g,
+    o,
+    h0,
+    ht,
+    T,
+    scale,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+):
+    i_bh = tl.program_id(0).to(tl.int64)
+    i_b, i_h = i_bh // HV, i_bh % HV
+    NT: tl.constexpr = tl.cdiv(T, 64)
+
+    o_i = tl.arange(0, 64)
+    m_A = o_i[:, None] >= o_i[None, :]
+
+    q += (i_b * T * H + i_h) * 64
+    k += (i_b * T * H + i_h) * 64
+    u += (i_b * T * HV + i_h) * 64
+    w += (i_b * T * HV + i_h) * 64
+    g += i_b * T * HV + i_h
+    o += (i_b * T * HV + i_h) * 64
+
+    b_h = tl.zeros([64, 64], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        p_h0 = tl.make_block_ptr(h0 + i_bh * 64 * 64, (64, 64), (64, 1), (0, 0), (64, 64), (1, 0))
+        b_h += tl.load(p_h0).to(tl.float32)
+
+    for i_t in range(NT):
+        p_q = tl.make_block_ptr(q, (T, 64), (H * 64, 1), (i_t * 64, 0), (64, 64), (1, 0))
+        p_k = tl.make_block_ptr(k, (64, T), (1, H * 64), (0, i_t * 64), (64, 64), (0, 1))
+        p_w = tl.make_block_ptr(w, (T, 64), (HV * 64, 1), (i_t * 64, 0), (64, 64), (1, 0))
+        p_u = tl.make_block_ptr(u, (T, 64), (HV * 64, 1), (i_t * 64, 0), (64, 64), (1, 0))
+        p_o = tl.make_block_ptr(o, (T, 64), (HV * 64, 1), (i_t * 64, 0), (64, 64), (1, 0))
+
+        b_q = tl.load(p_q)
+        b_kt = tl.load(p_k)
+        b_w = tl.load(p_w)
+        b_u = tl.load(p_u)
+
+        b_v_new = b_u - tl.dot(b_w, b_h.to(b_w.dtype))
+
+        b_g = tl.load(g + (i_t * 64 + o_i) * HV).to(tl.float32)
+        b_A = tl.dot(b_q, b_kt)
+        b_A = tl.where(m_A, b_A * exp2(b_g[:, None] - b_g[None, :]), 0.)
+        b_o = tl.dot(b_q, b_h.to(b_q.dtype)) * exp2(b_g)[:, None]
+        b_o += tl.dot(b_A.to(b_v_new.dtype), b_v_new)
+        tl.store(p_o, (b_o * scale).to(p_o.dtype.element_ty))
+
+        b_g_last = tl.load(g + (i_t * 64 + 63) * HV).to(tl.float32)
+        b_v_state = (b_v_new * exp2(b_g_last - b_g)[:, None]).to(k.dtype.element_ty)
+        b_h *= exp2(b_g_last)
+        b_h += tl.dot(b_kt, b_v_state)
+
+    if STORE_FINAL_STATE:
+        p_ht = tl.make_block_ptr(ht + i_bh * 64 * 64, (64, 64), (64, 1), (0, 0), (64, 64), (1, 0))
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty))
+
+
+def chunk_gated_delta_rule_fwd_h_o_dense_k64(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    u: torch.Tensor,
+    w: torch.Tensor,
+    g: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    B, T, H, K, V, HV = *q.shape, u.shape[-1], u.shape[2]
+    assert K == 64 and V == 64 and H == HV
+    o = torch.empty_like(u)
+    final_state = q.new_zeros(B, HV, K, V, dtype=torch.float32) if output_final_state else None
+    chunk_gated_delta_rule_fwd_h_o_dense_k64_kernel[(B * HV,)](
+        q=q,
+        k=k,
+        u=u,
+        w=w,
+        g=g,
+        o=o,
+        h0=initial_state,
+        ht=final_state,
+        T=T,
+        H=H,
+        HV=HV,
+        scale=scale,
+        num_warps=4,
+        num_stages=3,
+    )
+    return o, final_state
