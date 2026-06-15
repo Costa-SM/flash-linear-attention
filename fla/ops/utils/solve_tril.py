@@ -19,6 +19,18 @@ FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'ieee')
 assert FLA_TRIL_PRECISION in ['ieee', 'tf32', 'tf32x3'], \
     f"FLA_TRIL_PRECISION must be one of 'ieee', 'tf32', or 'tf32x3', but got {FLA_TRIL_PRECISION}"
 DOT_PRECISION_AUTOTUNE_LIST = ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee", FLA_TRIL_PRECISION})
+MERGE_64_AUTOTUNE_CONFIGS = [
+    triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4, 5]
+    for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
+]
+MERGE_64_TMA_DENSE_AUTOTUNE_CONFIGS = [
+    triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=1, num_stages=num_stages, maxnreg=maxnreg)
+    for num_stages in [2, 3, 4]
+    for maxnreg in [192, 224]
+    for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
+]
 
 
 @triton.heuristics({
@@ -177,21 +189,8 @@ def merge_16x16_to_32x32_inverse_kernel(
         desc_o.store([i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"))
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-@triton.autotune(
-    configs=[
-        triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-        for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
-    ],
-    key=['H', 'BT', 'IS_VARLEN'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
-def merge_16x16_to_64x64_inverse_kernel(
+def _merge_16x16_to_64x64_inverse_impl(
     A,
     Ai,
     cu_seqlens,
@@ -201,6 +200,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_DENSE_STATIC_LOOP: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
@@ -241,26 +241,48 @@ def merge_16x16_to_64x64_inverse_kernel(
     b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
     b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
 
-    for i in range(2, min(16, T - i_t * BT)):
-        b_a_11 = -tl.load(A + (i_t * BT + i) * H*BT + o_i)
-        b_a_11 = tl.where(o_i < i, b_a_11, 0.)
-        b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
-        b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
-    for i in range(16 + 2, min(32, T - i_t * BT)):
-        b_a_22 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 16)
-        b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.)
-        b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
-        b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
-    for i in range(32 + 2, min(48, T - i_t * BT)):
-        b_a_33 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 32)
-        b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.)
-        b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
-        b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
-    for i in range(48 + 2, min(64, T - i_t * BT)):
-        b_a_44 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 48)
-        b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.)
-        b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
-        b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
+    if not USE_DENSE_STATIC_LOOP:
+        for i in range(2, min(16, T - i_t * BT)):
+            b_a_11 = -tl.load(A + (i_t * BT + i) * H*BT + o_i)
+            b_a_11 = tl.where(o_i < i, b_a_11, 0.)
+            b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
+            b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
+        for i in range(16 + 2, min(32, T - i_t * BT)):
+            b_a_22 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 16)
+            b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.)
+            b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
+            b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
+        for i in range(32 + 2, min(48, T - i_t * BT)):
+            b_a_33 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 32)
+            b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.)
+            b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
+            b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
+        for i in range(48 + 2, min(64, T - i_t * BT)):
+            b_a_44 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 48)
+            b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.)
+            b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
+            b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
+    else:
+        for i in tl.static_range(2, 16):
+            b_a_11 = -tl.load(A + (i_t * BT + i) * H*BT + o_i)
+            b_a_11 = tl.where(o_i < i, b_a_11, 0.)
+            b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
+            b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
+        for i in tl.static_range(16 + 2, 32):
+            b_a_22 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 16)
+            b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.)
+            b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
+            b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
+        for i in tl.static_range(32 + 2, 48):
+            b_a_33 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 32)
+            b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.)
+            b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
+            b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
+        for i in tl.static_range(48 + 2, 64):
+            b_a_44 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 48)
+            b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.)
+            b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
+            b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
     b_Ai_11 += m_I
     b_Ai_22 += m_I
     b_Ai_33 += m_I
@@ -345,6 +367,75 @@ def merge_16x16_to_64x64_inverse_kernel(
         desc_o.store([i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"))
 
 
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=MERGE_64_AUTOTUNE_CONFIGS,
+    key=['H', 'BT', 'IS_VARLEN', 'USE_DENSE_STATIC_LOOP'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def merge_16x16_to_64x64_inverse_kernel(
+    A,
+    Ai,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    USE_TMA: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_DENSE_STATIC_LOOP: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    _merge_16x16_to_64x64_inverse_impl(
+        A,
+        Ai,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        H,
+        BT,
+        USE_TMA,
+        IS_VARLEN,
+        USE_DENSE_STATIC_LOOP,
+        DOT_PRECISION,
+    )
+
+
+@triton.autotune(
+    configs=MERGE_64_TMA_DENSE_AUTOTUNE_CONFIGS,
+    key=['H', 'BT'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def merge_16x16_to_64x64_inverse_tma_dense_kernel(
+    A,
+    Ai,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    USE_TMA: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    _merge_16x16_to_64x64_inverse_impl(
+        A,
+        Ai,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        H,
+        BT,
+        USE_TMA,
+        False,
+        False,
+        DOT_PRECISION,
+    )
+
+
 @input_guard
 def solve_tril(
     A: torch.Tensor,
@@ -384,14 +475,43 @@ def solve_tril(
     elif BT == 64:
         merge_fn = merge_16x16_to_64x64_inverse_kernel
 
-    merge_fn[NT, B * H](
-        A=A,
-        Ai=Ai,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        BT=BT,
-        USE_TMA=IS_TMA_SUPPORTED,
-    )
+    if BT == 64:
+        use_tma_dense_fast_path = IS_TMA_SUPPORTED and cu_seqlens is None and T % BT == 0 and NT * B * H >= 512
+        if use_tma_dense_fast_path:
+            merge_16x16_to_64x64_inverse_tma_dense_kernel[NT, B * H](
+                A=A,
+                Ai=Ai,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                T=T,
+                H=H,
+                BT=BT,
+                USE_TMA=IS_TMA_SUPPORTED,
+            )
+            return Ai
+
+        # The unrolled dense solve is faster only once the grid has enough CTAs to hide its higher register footprint.
+        use_dense_static_loop = cu_seqlens is None and T % BT == 0 and NT * B * H >= 512
+        merge_fn[NT, B * H](
+            A=A,
+            Ai=Ai,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            BT=BT,
+            USE_TMA=IS_TMA_SUPPORTED,
+            USE_DENSE_STATIC_LOOP=use_dense_static_loop,
+        )
+    else:
+        merge_fn[NT, B * H](
+            A=A,
+            Ai=Ai,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            BT=BT,
+            USE_TMA=IS_TMA_SUPPORTED,
+        )
     return Ai
