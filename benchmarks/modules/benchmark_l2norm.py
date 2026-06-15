@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from fla.modules.l2norm import l2norm
+from fla.modules.l2norm import l2norm, l2norm_fwd, l2norm_fwd_pair
 
 
 @triton.testing.perf_report(
@@ -23,9 +23,9 @@ from fla.modules.l2norm import l2norm
         # argument name whose value corresponds to a different line in the plot
         line_arg='provider',
         # possible values for `line_arg``
-        line_vals=['naive', 'compiled',  'fused', 'naive_bwd', 'compiled_bwd',  'fused_bwd'],
+        line_vals=['naive', 'compiled', 'fused', 'qk_separate', 'qk_fused', 'naive_bwd', 'compiled_bwd', 'fused_bwd'],
         # label name for the lines
-        line_names=['naive', 'compiled',  'fused', 'naive_bwd', 'compiled_bwd',  'fused_bwd'],
+        line_names=['naive', 'compiled', 'fused', 'qk_separate', 'qk_fused', 'naive_bwd', 'compiled_bwd', 'fused_bwd'],
         # line styles
         styles=[('green', '-'), ('blue', '--'), ('red', '-.'),
                 ('cyan', ':'), ('yellow', 'dotted'), ('cyan', '--'), ('cyan', '-'), ('black', ':')],
@@ -40,6 +40,8 @@ def benchmark(B, H, D, T, provider):
     dtype = torch.bfloat16
     requires_grad = True
     x = torch.randn(B * T, D, device=device, requires_grad=requires_grad, dtype=dtype)
+    q = torch.randn(B, T, H, D, device=device, dtype=dtype)
+    k = torch.randn(B, T, H, D, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
     results = 0, 0, 0
@@ -52,6 +54,10 @@ def benchmark(B, H, D, T, provider):
     if provider.startswith('fused'):
         norm = l2norm
         results = triton.testing.do_bench(lambda: norm(x), quantiles=quantiles)
+    if provider == 'qk_separate':
+        results = triton.testing.do_bench(lambda: (l2norm_fwd(q), l2norm_fwd(k)), quantiles=quantiles)
+    if provider == 'qk_fused':
+        results = triton.testing.do_bench(lambda: l2norm_fwd_pair(q, k), quantiles=quantiles)
     if provider.startswith('naive_bwd'):
         norm = partial(F.normalize, dim=-1, p=2)
         results = triton.testing.do_bench(lambda: norm(x).backward(x), quantiles=quantiles)
