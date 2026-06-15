@@ -85,7 +85,8 @@ def chunk_gated_delta_rule_fwd(
         and q.shape[-1] == 64
         and k.shape[-1] == 64
         and v.shape[-1] == 64
-        and q.shape[2] == v.shape[2]
+        and q.shape[2] == k.shape[2]
+        and v.shape[2] % q.shape[2] == 0
         and g is not None
         and T % 64 == 0
     )

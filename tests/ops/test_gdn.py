@@ -174,17 +174,18 @@ def test_chunk(
     assert_close('dh0', ref_dh0, tri_dh0, 0.008)
 
 
-def test_chunk_dense_h_o_fusion_matches_unfused():
+@pytest.mark.parametrize(('H', 'HV'), [(4, 4), (2, 4)])
+def test_chunk_dense_h_o_fusion_matches_unfused(H: int, HV: int):
     torch.manual_seed(42)
-    B, T, H, D = 2, 256, 4, 64
+    B, T, D = 2, 256, 64
     dtype = torch.float16
 
     q = F.normalize(torch.rand(B, T, H, D, dtype=dtype, device=device), p=2, dim=-1)
     k = F.normalize(torch.rand(B, T, H, D, dtype=dtype, device=device), p=2, dim=-1)
-    v = torch.rand(B, T, H, D, dtype=dtype, device=device)
-    beta = torch.rand(B, T, H, dtype=torch.float32, device=device).sigmoid()
-    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
-    h0 = torch.zeros(B, H, D, D, dtype=torch.float32, device=device)
+    v = torch.rand(B, T, HV, D, dtype=dtype, device=device)
+    beta = torch.rand(B, T, HV, dtype=torch.float32, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, HV, dtype=torch.float32, device=device))
+    h0 = torch.zeros(B, HV, D, D, dtype=torch.float32, device=device)
     scale = 0.1
 
     g = chunk_local_cumsum(g, chunk_size=64, scale=RCP_LN2)

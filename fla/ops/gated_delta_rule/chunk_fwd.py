@@ -416,13 +416,14 @@ def chunk_gated_delta_rule_fwd_h_o_dense_k64_kernel(
 ):
     i_bh = tl.program_id(0).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV
+    i_kh = i_h // (HV // H)
     NT: tl.constexpr = tl.cdiv(T, 64)
 
     o_i = tl.arange(0, 64)
     m_A = o_i[:, None] >= o_i[None, :]
 
-    q += (i_b * T * H + i_h) * 64
-    k += (i_b * T * H + i_h) * 64
+    q += (i_b * T * H + i_kh) * 64
+    k += (i_b * T * H + i_kh) * 64
     u += (i_b * T * HV + i_h) * 64
     w += (i_b * T * HV + i_h) * 64
     g += i_b * T * HV + i_h
@@ -475,7 +476,7 @@ def chunk_gated_delta_rule_fwd_h_o_dense_k64(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     B, T, H, K, V, HV = *q.shape, u.shape[-1], u.shape[2]
-    assert K == 64 and V == 64 and H == HV
+    assert K == 64 and V == 64 and HV % H == 0
     o = torch.empty_like(u)
     final_state = q.new_zeros(B, HV, K, V, dtype=torch.float32) if output_final_state else None
     chunk_gated_delta_rule_fwd_h_o_dense_k64_kernel[(B * HV,)](
