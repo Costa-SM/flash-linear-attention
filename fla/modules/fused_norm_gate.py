@@ -524,6 +524,83 @@ def layer_norm_gated_fwd(
     return y, mean, rstd, residual_out if residual_out is not None else x
 
 
+@triton.heuristics({
+    "HAS_WEIGHT": lambda args: args["w"] is not None,
+})
+@triton.autotune(
+    configs=[triton.Config({"BT": BT}, num_warps=num_warps) for BT in [16, 32, 64] for num_warps in [4, 8, 16]],
+    key=["D", "NB", "HAS_WEIGHT"],
+    **autotune_cache_kwargs,
+)
+@triton.jit
+def rms_norm_gated_fwd_only_kernel(
+    x,
+    g,
+    y,
+    w,
+    eps,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+    NB: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    mask = (o_t[:, None] < T) & (o_d[None, :] < D)
+    offsets = o_t[:, None].to(tl.int64) * D + o_d[None, :]
+
+    b_x = tl.load(x + offsets, mask=mask, other=0.0).to(tl.float32)
+    b_g = tl.load(g + offsets, mask=mask, other=0.0).to(tl.float32)
+    b_var = tl.sum(tl.where(o_d[None, :] < D, b_x * b_x, 0.0), axis=1) / D
+    b_y = b_x * (1 / tl.sqrt(b_var[:, None] + eps))
+    if HAS_WEIGHT:
+        b_w = tl.load(w + o_d, mask=o_d < D, other=0.0).to(tl.float32)
+        b_y *= b_w[None, :]
+    b_y *= b_g * tl.sigmoid(b_g)
+    tl.store(y + offsets, b_y.to(y.dtype.element_ty), mask=mask)
+
+
+@input_guard
+def rms_norm_gated_fwd_only(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+):
+    x_shape_og = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    g = g.reshape(-1, g.shape[-1])
+    T, D = x.shape
+    if weight is not None:
+        assert weight.shape == (D,)
+
+    y = torch.empty_like(x)
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    if D > BD:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    NB = triton.cdiv(T, 2048 * 32)
+
+    def grid(meta):
+        return (triton.cdiv(T, meta["BT"]),)
+
+    rms_norm_gated_fwd_only_kernel[grid](
+        x=x,
+        g=g,
+        y=y,
+        w=weight,
+        eps=eps,
+        T=T,
+        D=D,
+        BD=BD,
+        NB=NB,
+    )
+    return y.reshape(x_shape_og)
+
+
 def layer_norm_gated_bwd(
     dy: torch.Tensor,
     x: torch.Tensor,

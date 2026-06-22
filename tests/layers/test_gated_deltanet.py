@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 from fla.layers.gated_deltanet import GatedDeltaNet
 from fla.utils import assert_close, device
@@ -80,3 +81,51 @@ def test_gated_deltanet_fused_qkv_conv_matches_fallback(B: int, T: int, D: int, 
     # by tiny accumulation-order noise.
     for name in g_fused:
         assert_close(f'd{name}', g_sep[name], g_fused[name], 5e-3)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'D', 'dtype'),
+    [
+        pytest.param(*case, id="B{}-T{}-D{}-{}".format(*case))
+        for case in [
+            (1, 128, 512, torch.bfloat16),
+            (2, 256, 1024, torch.bfloat16),
+        ]
+    ],
+)
+def test_gated_deltanet_nograd_forward_stack_matches_fallback(B: int, T: int, D: int, dtype: torch.dtype):
+    torch.manual_seed(42)
+    layer = GatedDeltaNet(
+        hidden_size=D,
+        head_dim=64 if D == 512 else 128,
+        num_heads=6,
+        expand_v=2,
+        mode='chunk',
+    ).to(device=device, dtype=dtype).eval()
+
+    x = torch.randn(B, T, D, device=device, dtype=dtype)
+
+    with torch.no_grad():
+        y_fast = layer(x)[0]
+        with mock.patch.object(GatedDeltaNet, '_use_fused_qkv_conv', return_value=False):
+            y_ref = layer(x)[0]
+
+    assert_close('y', y_ref, y_fast, 5e-3)
+
+
+def test_gated_deltanet_packed_projection_is_nograd_only():
+    torch.manual_seed(42)
+    layer = GatedDeltaNet(
+        hidden_size=512,
+        head_dim=64,
+        num_heads=6,
+        expand_v=2,
+        mode='chunk',
+    ).to(device=device, dtype=torch.bfloat16).train()
+    x = torch.randn(1, 128, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+    with mock.patch('torch.nn.functional.linear', wraps=F.linear) as linear_mock:
+        layer(x)[0].sum().backward()
+
+    # Grad-enabled training should keep the existing separate projection path.
+    assert linear_mock.call_count >= 6

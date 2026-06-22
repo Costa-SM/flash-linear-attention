@@ -19,6 +19,7 @@ from torch.nn import functional as F
 from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, update_layer_cache
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.modules.convolution import causal_conv1d
+from fla.modules.fused_norm_gate import rms_norm_gated_fwd_only
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 if TYPE_CHECKING:
@@ -246,7 +247,57 @@ class GatedDeltaNet(nn.Module):
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
         conv_state_q, conv_state_k, conv_state_v = None, None, None
-        if self._use_fused_qkv_conv(last_state, use_cache, cu_seqlens):
+        use_fused_qkv_conv = self._use_fused_qkv_conv(last_state, use_cache, cu_seqlens)
+        use_packed_projection = use_fused_qkv_conv and not torch.is_grad_enabled()
+        if use_packed_projection:
+            qkvabg = F.linear(
+                hidden_states,
+                torch.cat(
+                    [
+                        self.q_proj.weight,
+                        self.k_proj.weight,
+                        self.v_proj.weight,
+                        self.a_proj.weight,
+                        self.b_proj.weight,
+                        self.g_proj.weight,
+                    ],
+                    dim=0,
+                ),
+            )
+            q, k, v, a, beta, g_proj = torch.split(
+                qkvabg,
+                [self.key_dim, self.key_dim, self.value_dim, self.num_v_heads, self.num_v_heads, self.value_dim],
+                dim=-1,
+            )
+            qkv = torch.cat(
+                [
+                    q,
+                    k,
+                    v,
+                ],
+                dim=-1,
+            )
+            qkv_weight = torch.cat(
+                [
+                    self.q_conv1d.weight.squeeze(1),
+                    self.k_conv1d.weight.squeeze(1),
+                    self.v_conv1d.weight.squeeze(1),
+                ],
+                dim=0,
+            )
+            if self.conv_bias:
+                qkv_bias = torch.cat([self.q_conv1d.bias, self.k_conv1d.bias, self.v_conv1d.bias], dim=0)
+            else:
+                qkv_bias = None
+            qkv, _ = causal_conv1d(
+                x=qkv,
+                weight=qkv_weight,
+                bias=qkv_bias,
+                activation=self.q_conv1d.activation,
+                backend=self.q_conv1d.backend,
+            )
+            q, k, v = torch.split(qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        elif use_fused_qkv_conv:
             qkv = torch.cat(
                 [
                     self.q_proj(hidden_states),
@@ -304,7 +355,8 @@ class GatedDeltaNet(nn.Module):
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
 
-        beta = self.b_proj(hidden_states)
+        if not use_packed_projection:
+            beta = self.b_proj(hidden_states)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
@@ -312,7 +364,7 @@ class GatedDeltaNet(nn.Module):
                 q=q,
                 k=k,
                 v=v,
-                g=self.a_proj(hidden_states),
+                g=a if use_packed_projection else self.a_proj(hidden_states),
                 beta=beta,
                 A_log=self.A_log,
                 dt_bias=self.dt_bias,
@@ -355,8 +407,14 @@ class GatedDeltaNet(nn.Module):
         )
 
         if self.use_gate:
-            g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
-            o = self.o_norm(o, g)
+            if use_packed_projection:
+                g = rearrange(g_proj, '... (h d) -> ... h d', d=self.head_v_dim)
+            else:
+                g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
+            if not self.training and not torch.is_grad_enabled() and self.o_norm.activation in ['swish', 'silu']:
+                o = rms_norm_gated_fwd_only(o, g, self.o_norm.weight, eps=self.o_norm.eps)
+            else:
+                o = self.o_norm(o, g)
         else:
             o = self.o_norm(o)
         o = rearrange(o, 'b t h d -> b t (h d)')
