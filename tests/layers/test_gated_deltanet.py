@@ -115,7 +115,10 @@ def test_gated_deltanet_fused_qkv_conv_cache_prefill_matches_fallback():
 
             conv_calls['n'] = 0
             cache_sep = FLACache()
-            with mock.patch.object(GatedDeltaNet, '_use_fused_qkv_conv', return_value=False):
+            with (
+                mock.patch.object(GatedDeltaNet, '_use_fused_qkv_conv', return_value=False),
+                mock.patch.object(GatedDeltaNet, '_use_fused_qkv_conv_step', return_value=False),
+            ):
                 y_sep, _, cache_sep = layer(x, past_key_values=cache_sep, use_cache=True)
                 sep_prefill_calls = conv_calls['n']
                 conv_calls['n'] = 0
@@ -127,7 +130,7 @@ def test_gated_deltanet_fused_qkv_conv_cache_prefill_matches_fallback():
 
     assert fused_prefill_calls == 0, f"cache prefill should use fused qkv conv, saw {fused_prefill_calls} conv calls"
     assert sep_prefill_calls == 3, f"separate cache prefill should call all three convs, saw {sep_prefill_calls}"
-    assert fused_decode_calls == 3, f"cached decode should fall back to step convs, saw {fused_decode_calls}"
+    assert fused_decode_calls == 0, f"cached decode should use fused qkv conv update, saw {fused_decode_calls} conv calls"
     assert sep_decode_calls == 3, f"separate cached decode should call all three convs, saw {sep_decode_calls}"
     assert_close('prefill', y_sep, y_fused, 0.0)
     assert_close('decode', y_sep_decode, y_fused_decode, 0.0)
