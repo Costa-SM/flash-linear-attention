@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from fla.layers.gated_deltanet import GatedDeltaNet
+from fla.models.utils import FLACache
 from fla.utils import assert_close, device
 
 
@@ -80,3 +81,53 @@ def test_gated_deltanet_fused_qkv_conv_matches_fallback(B: int, T: int, D: int, 
     # by tiny accumulation-order noise.
     for name in g_fused:
         assert_close(f'd{name}', g_sep[name], g_fused[name], 5e-3)
+
+
+def test_gated_deltanet_fused_qkv_conv_cache_prefill_matches_fallback():
+    torch.manual_seed(42)
+    B, T, D = 2, 128, 512
+    dtype = torch.bfloat16
+    layer = GatedDeltaNet(
+        hidden_size=D,
+        head_dim=64,
+        num_heads=6,
+        expand_v=2,
+        mode='chunk',
+        layer_idx=0,
+    ).to(device=device, dtype=dtype).eval()
+    x = torch.randn(B, T, D, device=device, dtype=dtype)
+    token = torch.randn(B, 1, D, device=device, dtype=dtype)
+
+    conv_calls = {'n': 0}
+
+    def bump(*_):
+        conv_calls['n'] += 1
+    handles = [m.register_forward_hook(bump) for m in (layer.q_conv1d, layer.k_conv1d, layer.v_conv1d)]
+    try:
+        with torch.no_grad():
+            conv_calls['n'] = 0
+            cache_fused = FLACache()
+            y_fused, _, cache_fused = layer(x, past_key_values=cache_fused, use_cache=True)
+            fused_prefill_calls = conv_calls['n']
+            conv_calls['n'] = 0
+            y_fused_decode, _, _ = layer(token, past_key_values=cache_fused, use_cache=True)
+            fused_decode_calls = conv_calls['n']
+
+            conv_calls['n'] = 0
+            cache_sep = FLACache()
+            with mock.patch.object(GatedDeltaNet, '_use_fused_qkv_conv', return_value=False):
+                y_sep, _, cache_sep = layer(x, past_key_values=cache_sep, use_cache=True)
+                sep_prefill_calls = conv_calls['n']
+                conv_calls['n'] = 0
+                y_sep_decode, _, _ = layer(token, past_key_values=cache_sep, use_cache=True)
+                sep_decode_calls = conv_calls['n']
+    finally:
+        for h in handles:
+            h.remove()
+
+    assert fused_prefill_calls == 0, f"cache prefill should use fused qkv conv, saw {fused_prefill_calls} conv calls"
+    assert sep_prefill_calls == 3, f"separate cache prefill should call all three convs, saw {sep_prefill_calls}"
+    assert fused_decode_calls == 3, f"cached decode should fall back to step convs, saw {fused_decode_calls}"
+    assert sep_decode_calls == 3, f"separate cached decode should call all three convs, saw {sep_decode_calls}"
+    assert_close('prefill', y_sep, y_fused, 0.0)
+    assert_close('decode', y_sep_decode, y_fused_decode, 0.0)

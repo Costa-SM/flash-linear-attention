@@ -208,7 +208,7 @@ class GatedDeltaNet(nn.Module):
         # The dense no-cache q/k/v short convolutions can collapse into a single
         # causal_conv1d only when there is no cache/varlen state and the three convs
         # share the same backend, activation, and kernel size.
-        if not (self.use_short_conv and last_state is None and not use_cache and cu_seqlens is None):
+        if not (self.use_short_conv and last_state is None and cu_seqlens is None):
             return False
         return (
             self.q_conv1d.backend == self.k_conv1d.backend == self.v_conv1d.backend and
@@ -247,6 +247,8 @@ class GatedDeltaNet(nn.Module):
 
         conv_state_q, conv_state_k, conv_state_v = None, None, None
         if self._use_fused_qkv_conv(last_state, use_cache, cu_seqlens):
+            if last_state is not None:
+                conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
             qkv = torch.cat(
                 [
                     self.q_proj(hidden_states),
@@ -267,13 +269,26 @@ class GatedDeltaNet(nn.Module):
                 qkv_bias = torch.cat([self.q_conv1d.bias, self.k_conv1d.bias, self.v_conv1d.bias], dim=0)
             else:
                 qkv_bias = None
+            if conv_state_q is not None:
+                qkv_state = torch.cat([conv_state_q, conv_state_k, conv_state_v], dim=1)
+            else:
+                qkv_state = None
             qkv, _ = causal_conv1d(
                 x=qkv,
                 weight=qkv_weight,
                 bias=qkv_bias,
+                initial_state=qkv_state,
+                output_final_state=use_cache,
                 activation=self.q_conv1d.activation,
                 backend=self.q_conv1d.backend,
             )
+            if use_cache:
+                qkv_state = _
+                conv_state_q, conv_state_k, conv_state_v = torch.split(
+                    qkv_state,
+                    [self.key_dim, self.key_dim, self.value_dim],
+                    dim=1,
+                )
             q, k, v = torch.split(qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         elif self.use_short_conv:
             if last_state is not None:
