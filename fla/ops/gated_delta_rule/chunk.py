@@ -20,7 +20,7 @@ from fla.ops.cp.chunk_delta_h import (
     compress_h0,
     expand_h0,
 )
-from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_h_o_dense_k64, chunk_gated_delta_rule_fwd_intra
 from fla.ops.gated_delta_rule.gate import gdn_gate_bwd, gdn_gate_chunk_cumsum
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum
@@ -46,6 +46,7 @@ def chunk_gated_delta_rule_fwd(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
 ):
+    T = q.shape[1]
     g_input = g if use_gate_in_kernel else None
     if use_gate_in_kernel:
         g = gdn_gate_chunk_cumsum(
@@ -75,6 +76,32 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+
+    # Dense K=V=64 avoids materializing h/v_new before the output kernel.
+    use_dense_h_o_fusion = (
+        cp_context is None
+        and cu_seqlens is None
+        and not state_v_first
+        and q.shape[-1] == 64
+        and k.shape[-1] == 64
+        and v.shape[-1] == 64
+        and q.shape[2] == k.shape[2]
+        and v.shape[2] % q.shape[2] == 0
+        and g is not None
+        and T % 64 == 0
+    )
+    if use_dense_h_o_fusion:
+        o, final_state = chunk_gated_delta_rule_fwd_h_o_dense_k64(
+            q=q,
+            k=k,
+            u=u,
+            w=w,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            scale=scale,
+        )
+        return g, o, A, final_state, initial_state, g_input
 
     if cp_context is not None:
         initial_state = chunk_gated_delta_rule_fwd_h_pre_process(

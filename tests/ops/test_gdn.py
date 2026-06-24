@@ -12,10 +12,15 @@ import torch
 import torch.nn.functional as F
 from einops import repeat
 
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from fla.ops.common.chunk_o import chunk_fwd_o
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_h_o_dense_k64, chunk_gated_delta_rule_fwd_intra
 from fla.ops.gated_delta_rule.gate import fused_gdn_gate, naive_gdn_gate
 from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+from fla.ops.utils import chunk_local_cumsum
+from fla.ops.utils.constant import RCP_LN2
 from fla.utils import IS_INTEL_ALCHEMIST, IS_NVIDIA_BLACKWELL, assert_close, device
 
 
@@ -188,6 +193,40 @@ def test_chunk(
     assert_close('db', ref_dbeta, tri_dbeta, 0.02)
     assert_close('dg', ref_dg, tri_dg, 0.02)
     assert_close('dh0', ref_dh0, tri_dh0, 0.008)
+
+
+@pytest.mark.parametrize(('H', 'HV'), [(4, 4), (2, 4)])
+def test_chunk_dense_h_o_fusion_matches_unfused(H: int, HV: int):
+    torch.manual_seed(42)
+    B, T, D = 2, 256, 64
+    dtype = torch.float16
+
+    q = F.normalize(torch.rand(B, T, H, D, dtype=dtype, device=device), p=2, dim=-1)
+    k = F.normalize(torch.rand(B, T, H, D, dtype=dtype, device=device), p=2, dim=-1)
+    v = torch.rand(B, T, HV, D, dtype=dtype, device=device)
+    beta = torch.rand(B, T, HV, dtype=torch.float32, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, HV, dtype=torch.float32, device=device))
+    h0 = torch.zeros(B, HV, D, D, dtype=torch.float32, device=device)
+    scale = 0.1
+
+    g = chunk_local_cumsum(g, chunk_size=64, scale=RCP_LN2)
+    w, u, _ = chunk_gated_delta_rule_fwd_intra(k=k, v=v, g=g, beta=beta)
+    h, v_new, ht_ref = chunk_gated_delta_rule_fwd_h(k=k, w=w, u=u, g=g, initial_state=h0, output_final_state=True)
+    o_ref = chunk_fwd_o(q=q, k=k, v=v_new, h=h, g=g, scale=scale)
+
+    o_tri, ht_tri = chunk_gated_delta_rule_fwd_h_o_dense_k64(
+        q=q,
+        k=k,
+        u=u,
+        w=w,
+        g=g,
+        initial_state=h0,
+        output_final_state=True,
+        scale=scale,
+    )
+
+    assert_close('o', o_ref, o_tri, 0.001)
+    assert_close('ht', ht_ref, ht_tri, 0.0)
 
 
 @pytest.mark.parametrize(

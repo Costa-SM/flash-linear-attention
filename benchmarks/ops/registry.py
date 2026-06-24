@@ -48,6 +48,10 @@ def shape_HD(B, T, H, D, **kw):
     return (H, D)
 
 
+def shape_BHDD(B, T, H, D, **kw):
+    return (B, H, D, D)
+
+
 def shape_D(B, T, H, D, **kw):
     return (D,)
 
@@ -327,6 +331,31 @@ register_op(OpConfig(
     extra_kwargs={'use_qk_l2norm_in_kernel': True},
     category='gate_beta',
     test_file='tests/ops/test_gdn.py',
+))
+
+
+def _gdn_dense64_post_init(inputs, B, T, H, D, **kw):
+    inputs['q'] = F.normalize(inputs['q'].detach(), p=2, dim=-1).requires_grad_(True)
+    inputs['k'] = F.normalize(inputs['k'].detach(), p=2, dim=-1).requires_grad_(True)
+
+
+register_op(OpConfig(
+    name='chunk_gdn_dense64',
+    import_path='fla.ops.gated_delta_rule',
+    inputs={
+        **_simple_qkv,
+        'g': TensorSpec(shape_BTH, dtype='float32', transform=logsigmoid),
+        'beta': TensorSpec(shape_BTH, dtype='float32', transform=sigmoid_transform),
+        'initial_state': TensorSpec(shape_BHDD, dtype='float32'),
+    },
+    func_name='chunk_gated_delta_rule',
+    extra_kwargs={'scale': 0.1, 'output_final_state': True},
+    post_init=_gdn_dense64_post_init,
+    category='gate_beta',
+    dim_constraints={'D': [64]},
+    default_shapes={
+        'B4_T2048_H8_D64_dense': {'B': 4, 'T': 2048, 'H': 8, 'D': 64},
+    },
 ))
 
 register_op(OpConfig(
