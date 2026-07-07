@@ -110,6 +110,45 @@ def l2norm_fwd_kernel(
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
+def l2norm_fwd_pair_kernel(
+    q,
+    k,
+    q_out,
+    k_out,
+    q_rstd,
+    k_rstd,
+    eps,
+    T,
+    D: tl.constexpr,
+    BD: tl.constexpr,
+    NB: tl.constexpr,
+    BT: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    offs_t = i_t * BT + tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    mask = (offs_t[:, None] < T) & (offs_d[None, :] < D)
+    offsets = offs_t[:, None] * D + offs_d[None, :]
+
+    b_q = tl.load(q + offsets, mask=mask, other=0.0).to(tl.float32)
+    b_k = tl.load(k + offsets, mask=mask, other=0.0).to(tl.float32)
+    b_q_rstd = 1 / tl.sqrt(tl.sum(b_q * b_q, 1) + eps)
+    b_k_rstd = 1 / tl.sqrt(tl.sum(b_k * b_k, 1) + eps)
+    b_q_out = b_q * b_q_rstd[:, None]
+    b_k_out = b_k * b_k_rstd[:, None]
+
+    tl.store(q_out + offsets, b_q_out.to(q_out.dtype.element_ty), mask=mask)
+    tl.store(k_out + offsets, b_k_out.to(k_out.dtype.element_ty), mask=mask)
+    tl.store(q_rstd + offs_t, b_q_rstd, mask=offs_t < T)
+    tl.store(k_rstd + offs_t, b_k_rstd, mask=offs_t < T)
+
+
+@fla_cache_autotune(
+    configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
+    key=["D", "NB"],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
 def l2norm_bwd_kernel(
     y,
     rstd,
@@ -185,6 +224,64 @@ def l2norm_fwd(
             BD=BD,
         )
     return y.view(x_shape_og), rstd.view(x_shape_og[:-1])
+
+
+def l2norm_fwd_pair(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+):
+    q_shape_og = q.shape
+    k_shape_og = k.shape
+    q = q.view(-1, q.shape[-1])
+    k = k.view(-1, k.shape[-1])
+    assert q.shape == k.shape
+    if output_dtype is None:
+        q_out = torch.empty_like(q)
+        k_out = torch.empty_like(k)
+    else:
+        q_out = torch.empty_like(q, dtype=output_dtype)
+        k_out = torch.empty_like(k, dtype=output_dtype)
+    assert q_out.stride(-1) == 1
+    assert k_out.stride(-1) == 1
+    T, D = q.shape[0], q.shape[-1]
+    MAX_FUSED_SIZE = 65536 // q.element_size()
+    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    if D > BD:
+        raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+
+    q_rstd = torch.empty((T,), dtype=torch.float32, device=q.device)
+    k_rstd = torch.empty((T,), dtype=torch.float32, device=k.device)
+    if D <= 512:
+        NB = triton.cdiv(T, 2048 * 32)
+
+        def grid(meta):
+            return (triton.cdiv(T, meta["BT"]),)
+
+        l2norm_fwd_pair_kernel[grid](
+            q=q,
+            k=k,
+            q_out=q_out,
+            k_out=k_out,
+            q_rstd=q_rstd,
+            k_rstd=k_rstd,
+            eps=eps,
+            T=T,
+            D=D,
+            BD=BD,
+            NB=NB,
+        )
+    else:
+        q_out, q_rstd = l2norm_fwd(q, eps=eps, output_dtype=output_dtype)
+        k_out, k_rstd = l2norm_fwd(k, eps=eps, output_dtype=output_dtype)
+        return q_out.view(q_shape_og), q_rstd.view(q_shape_og[:-1]), k_out.view(k_shape_og), k_rstd.view(k_shape_og[:-1])
+    return (
+        q_out.view(q_shape_og),
+        q_rstd.view(q_shape_og[:-1]),
+        k_out.view(k_shape_og),
+        k_rstd.view(k_shape_og[:-1]),
+    )
 
 
 def l2norm_bwd(
